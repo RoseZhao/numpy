@@ -12,6 +12,11 @@ from numpy.matrixlib.defmatrix import matrix_power
 from numpy.matrixlib import mat
 
 class TestCtor(TestCase):
+    def test_string_matrix(self):
+        test = matrix('True','True','False')
+        Expected = matrix([True, True, False])
+        assert_array_equal(test, Expected)
+        
     def test_basic(self):
         A = np.array([[1, 2], [3, 4]])
         mA = matrix(A)
