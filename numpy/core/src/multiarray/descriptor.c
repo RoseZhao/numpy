@@ -1041,8 +1041,11 @@ _convert_from_dict(PyObject *obj, int align)
     }
     n = PyObject_Length(names);
     offsets = Borrowed_PyMapping_GetItemString(obj, "offsets");
+    if (!offsets) {
+        PyErr_Clear();
+    }
     titles = Borrowed_PyMapping_GetItemString(obj, "titles");
-    if (!offsets || !titles) {
+    if (!titles) {
         PyErr_Clear();
     }
 
@@ -1097,6 +1100,8 @@ _convert_from_dict(PyObject *obj, int align)
         tup = PyTuple_New(len);
         descr = PyObject_GetItem(descrs, ind);
         if (!descr) {
+            Py_DECREF(tup);
+            Py_DECREF(ind);
             goto fail;
         }
         if (align) {
@@ -1120,17 +1125,23 @@ _convert_from_dict(PyObject *obj, int align)
             long offset;
             off = PyObject_GetItem(offsets, ind);
             if (!off) {
+                Py_DECREF(tup);
+                Py_DECREF(ind);
                 goto fail;
             }
             offset = PyArray_PyIntAsInt(off);
             if (offset == -1 && PyErr_Occurred()) {
                 Py_DECREF(off);
+                Py_DECREF(tup);
+                Py_DECREF(ind);
                 goto fail;
             }
             Py_DECREF(off);
             if (offset < 0) {
                 PyErr_Format(PyExc_ValueError, "offset %d cannot be negative",
                              (int)offset);
+                Py_DECREF(tup);
+                Py_DECREF(ind);
                 goto fail;
             }
 
@@ -1159,14 +1170,20 @@ _convert_from_dict(PyObject *obj, int align)
             PyTuple_SET_ITEM(tup, 1, PyInt_FromLong(totalsize));
             totalsize += newdescr->elsize;
         }
+        if (ret == NPY_FAIL) {
+            Py_DECREF(ind);
+            Py_DECREF(tup);
+            goto fail;
+        }
         if (len == 3) {
             PyTuple_SET_ITEM(tup, 2, title);
         }
         name = PyObject_GetItem(names, ind);
+        Py_DECREF(ind);
         if (!name) {
+            Py_DECREF(tup);
             goto fail;
         }
-        Py_DECREF(ind);
 #if defined(NPY_PY3K)
         if (!PyUString_Check(name)) {
 #else
@@ -1174,14 +1191,16 @@ _convert_from_dict(PyObject *obj, int align)
 #endif
             PyErr_SetString(PyExc_ValueError,
                     "field names must be strings");
-            ret = NPY_FAIL;
+            Py_DECREF(tup);
+            goto fail;
         }
 
         /* Insert into dictionary */
         if (PyDict_GetItem(fields, name) != NULL) {
             PyErr_SetString(PyExc_ValueError,
                     "name already used as a name or title");
-            ret = NPY_FAIL;
+            Py_DECREF(tup);
+            goto fail;
         }
         PyDict_SetItem(fields, name, tup);
         Py_DECREF(name);
@@ -1194,7 +1213,8 @@ _convert_from_dict(PyObject *obj, int align)
                 if (PyDict_GetItem(fields, title) != NULL) {
                     PyErr_SetString(PyExc_ValueError,
                             "title already used as a name or title.");
-                    ret=NPY_FAIL;
+                    Py_DECREF(tup);
+                    goto fail;
                 }
                 PyDict_SetItem(fields, title, tup);
             }
@@ -1930,6 +1950,25 @@ arraydescr_shape_get(PyArray_Descr *self)
     return Py_BuildValue("(O)", self->subarray->shape);
 }
 
+static PyObject *
+arraydescr_ndim_get(PyArray_Descr *self)
+{
+    if (!PyDataType_HASSUBARRAY(self)) {
+        return PyInt_FromLong(0);
+    }
+    /*TODO
+     * self->subarray->shape should always be a tuple,
+     * so this check should be unnecessary
+     */
+    if (PyTuple_Check(self->subarray->shape)) {
+        Py_ssize_t ndim = PyTuple_Size(self->subarray->shape);
+        return PyInt_FromLong(ndim);
+    }
+    /* consistent with arraydescr_shape_get */
+    return PyInt_FromLong(1);
+}
+
+
 NPY_NO_EXPORT PyObject *
 arraydescr_protocol_descr_get(PyArray_Descr *self)
 {
@@ -2187,6 +2226,9 @@ static PyGetSetDef arraydescr_getsets[] = {
         NULL, NULL, NULL},
     {"shape",
         (getter)arraydescr_shape_get,
+        NULL, NULL, NULL},
+    {"ndim",
+        (getter)arraydescr_ndim_get,
         NULL, NULL, NULL},
     {"isbuiltin",
         (getter)arraydescr_isbuiltin_get,

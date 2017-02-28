@@ -8,6 +8,7 @@ import warnings
 import operator
 import io
 import itertools
+import functools
 import ctypes
 import os
 import gc
@@ -44,6 +45,32 @@ if sys.version_info[:2] > (3, 2):
     EMPTY = ()
 else:
     EMPTY = None
+
+
+def _aligned_zeros(shape, dtype=float, order="C", align=None):
+    """Allocate a new ndarray with aligned memory."""
+    dtype = np.dtype(dtype)
+    if dtype == np.dtype(object):
+        # Can't do this, fall back to standard allocation (which
+        # should always be sufficiently aligned)
+        if align is not None:
+            raise ValueError("object array alignment not supported")
+        return np.zeros(shape, dtype=dtype, order=order)
+    if align is None:
+        align = dtype.alignment
+    if not hasattr(shape, '__len__'):
+        shape = (shape,)
+    size = functools.reduce(operator.mul, shape) * dtype.itemsize
+    buf = np.empty(size + align + 1, np.uint8)
+    offset = buf.__array_interface__['data'][0] % align
+    if offset != 0:
+        offset = align - offset
+    # Note: slices producing 0-size arrays do not necessarily change
+    # data pointer --- so we use and allocate size+1
+    buf = buf[offset:offset+size+1][:-1]
+    data = np.ndarray(shape, dtype, buf, order=order)
+    data.fill(0)
+    return data
 
 
 class TestFlags(TestCase):
@@ -1986,13 +2013,13 @@ class TestMethods(TestCase):
             d = np.array([2, 1])
             d.partition(0, kind=k)
             assert_raises(ValueError, d.partition, 2)
-            assert_raises(ValueError, d.partition, 3, axis=1)
+            assert_raises(np.AxisError, d.partition, 3, axis=1)
             assert_raises(ValueError, np.partition, d, 2)
-            assert_raises(ValueError, np.partition, d, 2, axis=1)
+            assert_raises(np.AxisError, np.partition, d, 2, axis=1)
             assert_raises(ValueError, d.argpartition, 2)
-            assert_raises(ValueError, d.argpartition, 3, axis=1)
+            assert_raises(np.AxisError, d.argpartition, 3, axis=1)
             assert_raises(ValueError, np.argpartition, d, 2)
-            assert_raises(ValueError, np.argpartition, d, 2, axis=1)
+            assert_raises(np.AxisError, np.argpartition, d, 2, axis=1)
             d = np.arange(10).reshape((2, 5))
             d.partition(1, axis=0, kind=k)
             d.partition(4, axis=1, kind=k)
@@ -2335,7 +2362,11 @@ class TestMethods(TestCase):
                   if code not in 'USVM']
         for dtype in dtypes:
             a = np.random.rand(3, 3).astype(dtype)
-            b = np.random.rand(3, 3).astype(dtype)
+
+            # Valid dot() output arrays must be aligned
+            b = _aligned_zeros((3, 3), dtype=dtype)
+            b[...] = np.random.rand(3, 3)
+
             y = np.dot(a, b)
             x = np.dot(a, b, out=b)
             assert_equal(x, y, err_msg=repr(dtype))
@@ -2712,8 +2743,9 @@ class TestBinop(object):
         #    d = input.copy() # refcount 1
         #    return d, d + d # PyNumber_Add without increasing refcount
         from numpy.core.multiarray_tests import incref_elide
-        d = np.ones(5)
+        d = np.ones(100000)
         orig, res = incref_elide(d)
+        d + d
         # the return original should not be changed to an inplace operation
         assert_array_equal(orig, d)
         assert_array_equal(res, d + d)
@@ -2727,11 +2759,51 @@ class TestBinop(object):
         #    return l[4] + l[4] # PyNumber_Add without increasing refcount
         from numpy.core.multiarray_tests import incref_elide_l
         # padding with 1 makes sure the object on the stack is not overwriten
-        l = [1, 1, 1, 1, np.ones(5)]
+        l = [1, 1, 1, 1, np.ones(100000)]
         res = incref_elide_l(l)
         # the return original should not be changed to an inplace operation
-        assert_array_equal(l[4], np.ones(5))
+        assert_array_equal(l[4], np.ones(100000))
         assert_array_equal(res, l[4] + l[4])
+
+    def test_temporary_with_cast(self):
+        # check that we don't elide into a temporary which would need casting
+        d = np.ones(200000, dtype=np.int64)
+        assert_equal(((d + d) + 2**222).dtype, np.dtype('O'))
+
+        r = ((d + d) / 2)
+        assert_equal(r.dtype, np.dtype('f8'))
+
+        r = np.true_divide((d + d), 2)
+        assert_equal(r.dtype, np.dtype('f8'))
+
+        r = ((d + d) / 2.)
+        assert_equal(r.dtype, np.dtype('f8'))
+
+        r = ((d + d) // 2)
+        assert_equal(r.dtype, np.dtype(np.int64))
+
+        # commutative elision into the astype result
+        f = np.ones(100000, dtype=np.float32)
+        assert_equal(((f + f) + f.astype(np.float64)).dtype, np.dtype('f8'))
+
+        # no elision into f + f
+        d = f.astype(np.float64)
+        assert_equal(((f + f) + d).dtype, np.dtype('f8'))
+
+    def test_elide_broadcast(self):
+        # test no elision on broadcast to higher dimension
+        # only triggers elision code path in debug mode as triggering it in
+        # normal mode needs 256kb large matching dimension, so a lot of memory
+        d = np.ones((2000, 1), dtype=int)
+        b = np.ones((2000), dtype=np.bool)
+        r = (1 - d) + b
+        assert_equal(r, 1)
+        assert_equal(r.shape, (2000, 2000))
+
+    def test_elide_scalar(self):
+        # check inplace op does not create ndarray from scalars
+        a = np.bool_()
+        assert_(type(~(a & a)) is np.bool_)
 
     def test_ufunc_override_rop_precedence(self):
         # 2016-01-29: NUMPY_UFUNC_DISABLED
@@ -3491,8 +3563,8 @@ class TestArgmin(TestCase):
 class TestMinMax(TestCase):
 
     def test_scalar(self):
-        assert_raises(ValueError, np.amax, 1, 1)
-        assert_raises(ValueError, np.amin, 1, 1)
+        assert_raises(np.AxisError, np.amax, 1, 1)
+        assert_raises(np.AxisError, np.amin, 1, 1)
 
         assert_equal(np.amax(1, axis=0), 1)
         assert_equal(np.amin(1, axis=0), 1)
@@ -3500,7 +3572,7 @@ class TestMinMax(TestCase):
         assert_equal(np.amin(1, axis=None), 1)
 
     def test_axis(self):
-        assert_raises(ValueError, np.amax, [1, 2, 3], 1000)
+        assert_raises(np.AxisError, np.amax, [1, 2, 3], 1000)
         assert_equal(np.amax([[1, 2, 3]], axis=1), 3)
 
     def test_datetime(self):
@@ -3762,7 +3834,7 @@ class TestLexsort(TestCase):
 
     def test_invalid_axis(self): # gh-7528
         x = np.linspace(0., 1., 42*3).reshape(42, 3)
-        assert_raises(ValueError, np.lexsort, x, axis=2)
+        assert_raises(np.AxisError, np.lexsort, x, axis=2)
 
 class TestIO(object):
     """Test tofile, fromfile, tobytes, and fromstring"""

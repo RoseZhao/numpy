@@ -25,6 +25,7 @@ from numpy.core import (
     finfo, errstate, geterrobj, longdouble, rollaxis, amin, amax, product, abs,
     broadcast, atleast_2d, intp, asanyarray, isscalar, object_
     )
+from numpy.core.multiarray import normalize_axis_index
 from numpy.lib import triu, asfarray
 from numpy.linalg import lapack_lite, _umath_linalg
 from numpy.matrixlib.defmatrix import matrix_power
@@ -191,15 +192,15 @@ def _fastCopyAndTranspose(type, *arrays):
 
 def _assertRank2(*arrays):
     for a in arrays:
-        if len(a.shape) != 2:
+        if a.ndim != 2:
             raise LinAlgError('%d-dimensional array given. Array must be '
-                    'two-dimensional' % len(a.shape))
+                    'two-dimensional' % a.ndim)
 
 def _assertRankAtLeast2(*arrays):
     for a in arrays:
-        if len(a.shape) < 2:
+        if a.ndim < 2:
             raise LinAlgError('%d-dimensional array given. Array must be '
-                    'at least two-dimensional' % len(a.shape))
+                    'at least two-dimensional' % a.ndim)
 
 def _assertSquareness(*arrays):
     for a in arrays:
@@ -230,7 +231,7 @@ def tensorsolve(a, b, axes=None):
 
     It is assumed that all indices of `x` are summed over in the product,
     together with the rightmost indices of `a`, as is done in, for example,
-    ``tensordot(a, x, axes=len(b.shape))``.
+    ``tensordot(a, x, axes=b.ndim)``.
 
     Parameters
     ----------
@@ -1138,6 +1139,7 @@ def eig(a):
 
     """
     a, wrap = _makearray(a)
+    _assertNoEmpty2d(a)
     _assertRankAtLeast2(a)
     _assertNdSquareness(a)
     _assertFinite(a)
@@ -1278,6 +1280,7 @@ def eigh(a, UPLO='L'):
     a, wrap = _makearray(a)
     _assertRankAtLeast2(a)
     _assertNdSquareness(a)
+    _assertNoEmpty2d(a)
     t, result_t = _commonType(a)
 
     extobj = get_linalg_error_extobj(
@@ -1914,10 +1917,11 @@ def lstsq(a, b, rcond=-1):
     import math
     a, _ = _makearray(a)
     b, wrap = _makearray(b)
-    is_1d = len(b.shape) == 1
+    is_1d = b.ndim == 1
     if is_1d:
         b = b[:, newaxis]
     _assertRank2(a, b)
+    _assertNoEmpty2d(a, b)  # TODO: relax this constraint
     m  = a.shape[0]
     n  = a.shape[1]
     n_rhs = b.shape[1]
@@ -1932,6 +1936,14 @@ def lstsq(a, b, rcond=-1):
     a, bstar = _fastCopyAndTranspose(t, a, bstar)
     a, bstar = _to_native_byte_order(a, bstar)
     s = zeros((min(m, n),), real_t)
+    # This line:
+    #  * is incorrect, according to the LAPACK documentation
+    #  * raises a ValueError if min(m,n) == 0
+    #  * should not be calculated here anyway, as LAPACK should calculate
+    #    `liwork` for us. But that only works if our version of lapack does
+    #    not have this bug:
+    #      http://icl.cs.utk.edu/lapack-forum/archives/lapack/msg00899.html
+    #    Lapack_lite does have that bug...
     nlvl = max( 0, int( math.log( float(min(m, n))/2. ) ) + 1 )
     iwork = zeros((3*min(m, n)*nlvl+11*min(m, n),), fortran_int)
     if isComplexType(t):
@@ -2225,13 +2237,8 @@ def norm(x, ord=None, axis=None, keepdims=False):
             return add.reduce(absx, axis=axis, keepdims=keepdims) ** (1.0 / ord)
     elif len(axis) == 2:
         row_axis, col_axis = axis
-        if row_axis < 0:
-            row_axis += nd
-        if col_axis < 0:
-            col_axis += nd
-        if not (0 <= row_axis < nd and 0 <= col_axis < nd):
-            raise ValueError('Invalid axis %r for an array with shape %r' %
-                             (axis, x.shape))
+        row_axis = normalize_axis_index(row_axis, nd)
+        col_axis = normalize_axis_index(col_axis, nd)
         if row_axis == col_axis:
             raise ValueError('Duplicate axes given.')
         if ord == 2:

@@ -17,7 +17,7 @@ from .multiarray import (
     inner, int_asbuffer, lexsort, matmul, may_share_memory,
     min_scalar_type, ndarray, nditer, nested_iters, promote_types,
     putmask, result_type, set_numeric_ops, shares_memory, vdot, where,
-    zeros)
+    zeros, normalize_axis_index)
 if sys.version_info[0] < 3:
     from .multiarray import newbuffer, getbuffer
 
@@ -27,7 +27,7 @@ from .umath import (invert, sin, UFUNC_BUFSIZE_DEFAULT, ERR_IGNORE,
                     ERR_DEFAULT, PINF, NAN)
 from . import numerictypes
 from .numerictypes import longlong, intc, int_, float_, complex_, bool_
-from ._internal import TooHardError
+from ._internal import TooHardError, AxisError
 
 bitwise_not = invert
 ufunc = type(sin)
@@ -65,7 +65,7 @@ __all__ = [
     'True_', 'bitwise_not', 'CLIP', 'RAISE', 'WRAP', 'MAXDIMS', 'BUFSIZE',
     'ALLOW_THREADS', 'ComplexWarning', 'full', 'full_like', 'matmul',
     'shares_memory', 'may_share_memory', 'MAY_SHARE_BOUNDS', 'MAY_SHARE_EXACT',
-    'TooHardError',
+    'TooHardError', 'AxisError'
     ]
 
 
@@ -1354,9 +1354,9 @@ def tensordot(a, b, axes=2):
 
     a, b = asarray(a), asarray(b)
     as_ = a.shape
-    nda = len(a.shape)
+    nda = a.ndim
     bs = b.shape
-    ndb = len(b.shape)
+    ndb = b.ndim
     equal = True
     if na != nb:
         equal = False
@@ -1461,7 +1461,7 @@ def roll(a, shift, axis=None):
 
     else:
         broadcasted = broadcast(shift, axis)
-        if len(broadcasted.shape) > 1:
+        if broadcasted.ndim > 1:
             raise ValueError(
                 "'shift' and 'axis' should be scalars or 1D sequences")
         shifts = {ax: 0 for ax in range(a.ndim)}
@@ -1527,15 +1527,12 @@ def rollaxis(a, axis, start=0):
 
     """
     n = a.ndim
-    if axis < 0:
-        axis += n
+    axis = normalize_axis_index(axis, n)
     if start < 0:
         start += n
     msg = "'%s' arg requires %d <= %s < %d, but %d was passed in"
-    if not (0 <= axis < n):
-        raise ValueError(msg % ('axis', -n, 'axis', n, axis))
     if not (0 <= start < n + 1):
-        raise ValueError(msg % ('start', -n, 'start', n + 1, start))
+        raise AxisError(msg % ('start', -n, 'start', n + 1, start))
     if axis < start:
         # it's been removed
         start -= 1
@@ -1554,7 +1551,7 @@ def _validate_axis(axis, ndim, argname):
         axis = list(axis)
     axis = [a + ndim if a < 0 else a for a in axis]
     if not builtins.all(0 <= a < ndim for a in axis):
-        raise ValueError('invalid axis for this array in `%s` argument' %
+        raise AxisError('invalid axis for this array in `%s` argument' %
                          argname)
     if len(set(axis)) != len(axis):
         raise ValueError('repeated axis in `%s` argument' % argname)
@@ -1893,35 +1890,35 @@ def array_repr(arr, max_line_width=None, precision=None, suppress_small=None):
     'array([ 0.000001,  0.      ,  2.      ,  3.      ])'
 
     """
+    if type(arr) is not ndarray:
+        class_name = type(arr).__name__
+    else:
+        class_name = "array"
+
     if arr.size > 0 or arr.shape == (0,):
         lst = array2string(arr, max_line_width, precision, suppress_small,
-                           ', ', "array(")
+                           ', ', class_name + "(")
     else:  # show zero-length shape unless it is (0,)
         lst = "[], shape=%s" % (repr(arr.shape),)
-
-    if arr.__class__ is not ndarray:
-        cName = arr.__class__.__name__
-    else:
-        cName = "array"
 
     skipdtype = (arr.dtype.type in _typelessdata) and arr.size > 0
 
     if skipdtype:
-        return "%s(%s)" % (cName, lst)
+        return "%s(%s)" % (class_name, lst)
     else:
         typename = arr.dtype.name
         # Quote typename in the output if it is "complex".
         if typename and not (typename[0].isalpha() and typename.isalnum()):
             typename = "'%s'" % typename
 
-        lf = ''
+        lf = ' '
         if issubclass(arr.dtype.type, flexible):
             if arr.dtype.names:
                 typename = "%s" % str(arr.dtype)
             else:
                 typename = "'%s'" % str(arr.dtype)
-            lf = '\n'+' '*len("array(")
-        return cName + "(%s, %sdtype=%s)" % (lst, lf, typename)
+            lf = '\n'+' '*len(class_name + "(")
+        return "%s(%s,%sdtype=%s)" % (class_name, lst, lf, typename)
 
 
 def array_str(a, max_line_width=None, precision=None, suppress_small=None):
@@ -2089,15 +2086,12 @@ def indices(dimensions, dtype=int):
     """
     dimensions = tuple(dimensions)
     N = len(dimensions)
-    if N == 0:
-        return array([], dtype=dtype)
+    shape = (1,)*N
     res = empty((N,)+dimensions, dtype=dtype)
     for i, dim in enumerate(dimensions):
-        tmp = arange(dim, dtype=dtype)
-        tmp.shape = (1,)*i + (dim,)+(1,)*(N-i-1)
-        newdim = dimensions[:i] + (1,) + dimensions[i+1:]
-        val = zeros(newdim, dtype)
-        add(tmp, val, res[i])
+        res[i] = arange(dim, dtype=dtype).reshape(
+            shape[:i] + (dim,) + shape[i+1:]
+        )
     return res
 
 
@@ -2212,7 +2206,7 @@ def binary_repr(num, width=None):
         designated form.
 
         If the `width` value is insufficient, it will be ignored, and `num` will
-        be returned in binary(`num` > 0) or two's complement (`num` < 0) form
+        be returned in binary (`num` > 0) or two's complement (`num` < 0) form
         with its width equal to the minimum number of bits needed to represent
         the number in the designated form. This behavior is deprecated and will
         later raise an error.
@@ -2282,10 +2276,16 @@ def binary_repr(num, width=None):
 
         else:
             poswidth = len(bin(-num)[2:])
-            twocomp = 2**(poswidth + 1) + num
 
+            # See gh-8679: remove extra digit
+            # for numbers at boundaries.
+            if 2**(poswidth - 1) == -num:
+                poswidth -= 1
+
+            twocomp = 2**(poswidth + 1) + num
             binary = bin(twocomp)[2:]
             binwidth = len(binary)
+
             outwidth = max(binwidth, width)
             warn_if_insufficient(width, binwidth)
             return '1' * (outwidth - binwidth) + binary

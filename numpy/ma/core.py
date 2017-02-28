@@ -23,6 +23,7 @@ Released for unlimited redistribution.
 from __future__ import division, absolute_import, print_function
 
 import sys
+import operator
 import warnings
 from functools import reduce
 
@@ -41,6 +42,7 @@ from numpy.compat import (
     getargspec, formatargspec, long, basestring, unicode, bytes, sixu
     )
 from numpy import expand_dims as n_expand_dims
+from numpy.core.multiarray import normalize_axis_index
 
 
 if sys.version_info[0] >= 3:
@@ -1601,21 +1603,11 @@ def make_mask(m, copy=False, shrink=True, dtype=MaskType):
     """
     if m is nomask:
         return nomask
-    elif isinstance(m, ndarray):
-        # We won't return after this point to make sure we can shrink the mask
-        # Fill the mask in case there are missing data
-        m = filled(m, True)
-        # Make sure the input dtype is valid
-        dtype = make_mask_descr(dtype)
-        if m.dtype == dtype:
-            if copy:
-                result = m.copy()
-            else:
-                result = m
-        else:
-            result = np.array(m, dtype=dtype, copy=copy)
-    else:
-        result = np.array(filled(m, True), dtype=MaskType)
+
+    # Make sure the input dtype is valid.
+    dtype = make_mask_descr(dtype)
+    # Fill the mask in case there are missing data; turn it into an ndarray.
+    result = np.array(filled(m, True), copy=copy, dtype=dtype, subok=True)
     # Bas les masques !
     if shrink and (not result.dtype.names) and (not result.any()):
         return nomask
@@ -1732,7 +1724,8 @@ def mask_or(m1, m2, copy=False, shrink=True):
     if (dtype1 != dtype2):
         raise ValueError("Incompatible dtypes '%s'<>'%s'" % (dtype1, dtype2))
     if dtype1.names:
-        newmask = np.empty_like(m1)
+        # Allocate an output mask array with the properly broadcast shape.
+        newmask = np.empty(np.broadcast(m1, m2).shape, dtype1)
         _recursive_mask_or(m1, m2, newmask)
         return newmask
     return make_mask(umath.logical_or(m1, m2), copy=copy, shrink=shrink)
@@ -2299,7 +2292,7 @@ def masked_values(x, value, rtol=1e-5, atol=1e-8, copy=True, shrink=True):
     if issubclass(xnew.dtype.type, np.floating):
         condition = umath.less_equal(
             mabs(xnew - value), atol + rtol * mabs(value))
-        mask = getattr(x, '_mask', nomask)
+        mask = getmask(x)
     else:
         condition = umath.equal(xnew, value)
         mask = nomask
@@ -2948,10 +2941,9 @@ class MaskedArray(ndarray):
             # XX: This looks like a bug -- shouldn't it check self.dtype
             # instead?
             if obj.dtype.names:
-                _mask = getattr(obj, '_mask',
-                                make_mask_none(obj.shape, obj.dtype))
+                _mask = getmaskarray(obj)
             else:
-                _mask = getattr(obj, '_mask', nomask)
+                _mask = getmask(obj)
 
             # If self and obj point to exactly the same data, then probably
             # self is a simple view of obj (e.g., self = obj[...]), so they
@@ -3107,7 +3099,7 @@ class MaskedArray(ndarray):
         # also make the mask be a view (so attr changes to the view's
         # mask do no affect original object's mask)
         # (especially important to avoid affecting np.masked singleton)
-        if (getattr(output, '_mask', nomask) is not nomask):
+        if (getmask(output) is not nomask):
             output._mask = output._mask.view()
 
         # Make sure to reset the _fill_value if needed
@@ -3204,7 +3196,7 @@ class MaskedArray(ndarray):
                     # If we're indexing a multidimensional field in a
                     # structured array (such as dtype("(2,)i2,(2,)i1")),
                     # dimensionality goes up (M[field].ndim == M.ndim +
-                    # len(M.dtype[field].shape)).  That's fine for
+                    # M.dtype[field].ndim).  That's fine for
                     # M[field] but problematic for M[field].fill_value
                     # which should have shape () to avoid breaking several
                     # methods. There is no great way out, so set to
@@ -3267,9 +3259,9 @@ class MaskedArray(ndarray):
             return
 
         # Get the _data part of the new value
-        dval = value
+        dval = getattr(value, '_data', value)
         # Get the _mask part of the new value
-        mval = getattr(value, '_mask', nomask)
+        mval = getmask(value)
         if nbfields and mval is nomask:
             mval = tuple([False] * nbfields)
         if _mask is nomask:
@@ -3330,26 +3322,6 @@ class MaskedArray(ndarray):
                 self._mask.shape = self.shape
             except (AttributeError, TypeError):
                 pass
-
-    def __getslice__(self, i, j):
-        """
-        x.__getslice__(i, j) <==> x[i:j]
-
-        Return the slice described by (i, j).  The use of negative indices
-        is not supported.
-
-        """
-        return self.__getitem__(slice(i, j))
-
-    def __setslice__(self, i, j, value):
-        """
-        x.__setslice__(i, j, value) <==> x[i:j]=value
-
-        Set the slice (i,j) of a to value. If value is masked, mask those
-        locations.
-
-        """
-        self.__setitem__(slice(i, j), value)
 
     def __setmask__(self, mask, copy=False):
         """
@@ -3866,7 +3838,7 @@ class MaskedArray(ndarray):
         Literal string representation.
 
         """
-        n = len(self.shape)
+        n = self.ndim
         if self._baseclass is np.ndarray:
             name = 'array'
         else:
@@ -3893,77 +3865,84 @@ class MaskedArray(ndarray):
                 return True
         return False
 
-    def __eq__(self, other):
-        """
-        Check whether other equals self elementwise.
+    def _comparison(self, other, compare):
+        """Compare self with other using operator.eq or operator.ne.
 
+        When either of the elements is masked, the result is masked as well,
+        but the underlying boolean data are still set, with self and other
+        considered equal if both are masked, and unequal otherwise.
+
+        For structured arrays, all fields are combined, with masked values
+        ignored. The result is masked if all fields were masked, with self
+        and other considered equal only if both were fully masked.
         """
-        if self is masked:
-            return masked
-        omask = getattr(other, '_mask', nomask)
-        if omask is nomask:
-            check = self.filled(0).__eq__(other)
-            try:
-                check = check.view(type(self))
-                check._mask = self._mask
-            except AttributeError:
-                # Dang, we have a bool instead of an array: return the bool
-                return check
+        omask = getmask(other)
+        smask = self.mask
+        mask = mask_or(smask, omask, copy=True)
+
+        odata = getdata(other)
+        if mask.dtype.names:
+            # For possibly masked structured arrays we need to be careful,
+            # since the standard structured array comparison will use all
+            # fields, masked or not. To avoid masked fields influencing the
+            # outcome, we set all masked fields in self to other, so they'll
+            # count as equal.  To prepare, we ensure we have the right shape.
+            broadcast_shape = np.broadcast(self, odata).shape
+            sbroadcast = np.broadcast_to(self, broadcast_shape, subok=True)
+            sbroadcast._mask = mask
+            sdata = sbroadcast.filled(odata)
+            # Now take care of the mask; the merged mask should have an item
+            # masked if all fields were masked (in one and/or other).
+            mask = (mask == np.ones((), mask.dtype))
+
         else:
-            odata = filled(other, 0)
-            check = self.filled(0).__eq__(odata).view(type(self))
-            if self._mask is nomask:
-                check._mask = omask
-            else:
-                mask = mask_or(self._mask, omask)
-                if mask.dtype.names:
-                    if mask.size > 1:
-                        axis = 1
-                    else:
-                        axis = None
-                    try:
-                        mask = mask.view((bool_, len(self.dtype))).all(axis)
-                    except ValueError:
-                        mask = np.all([[f[n].all() for n in mask.dtype.names]
-                                       for f in mask], axis=axis)
-                check._mask = mask
+            # For regular arrays, just use the data as they come.
+            sdata = self.data
+
+        check = compare(sdata, odata)
+
+        if isinstance(check, (np.bool_, bool)):
+            return masked if mask else check
+
+        if mask is not nomask:
+            # Adjust elements that were masked, which should be treated
+            # as equal if masked in both, unequal if masked in one.
+            # Note that this works automatically for structured arrays too.
+            check = np.where(mask, compare(smask, omask), check)
+            if mask.shape != check.shape:
+                # Guarantee consistency of the shape, making a copy since the
+                # the mask may need to get written to later.
+                mask = np.broadcast_to(mask, check.shape).copy()
+
+        check = check.view(type(self))
+        check._mask = mask
         return check
+
+    def __eq__(self, other):
+        """Check whether other equals self elementwise.
+
+        When either of the elements is masked, the result is masked as well,
+        but the underlying boolean data are still set, with self and other
+        considered equal if both are masked, and unequal otherwise.
+
+        For structured arrays, all fields are combined, with masked values
+        ignored. The result is masked if all fields were masked, with self
+        and other considered equal only if both were fully masked.
+        """
+        return self._comparison(other, operator.eq)
 
     def __ne__(self, other):
-        """
-        Check whether other doesn't equal self elementwise
+        """Check whether other does not equal self elementwise.
 
+        When either of the elements is masked, the result is masked as well,
+        but the underlying boolean data are still set, with self and other
+        considered equal if both are masked, and unequal otherwise.
+
+        For structured arrays, all fields are combined, with masked values
+        ignored. The result is masked if all fields were masked, with self
+        and other considered equal only if both were fully masked.
         """
-        if self is masked:
-            return masked
-        omask = getattr(other, '_mask', nomask)
-        if omask is nomask:
-            check = self.filled(0).__ne__(other)
-            try:
-                check = check.view(type(self))
-                check._mask = self._mask
-            except AttributeError:
-                # In case check is a boolean (or a numpy.bool)
-                return check
-        else:
-            odata = filled(other, 0)
-            check = self.filled(0).__ne__(odata).view(type(self))
-            if self._mask is nomask:
-                check._mask = omask
-            else:
-                mask = mask_or(self._mask, omask)
-                if mask.dtype.names:
-                    if mask.size > 1:
-                        axis = 1
-                    else:
-                        axis = None
-                    try:
-                        mask = mask.view((bool_, len(self.dtype))).all(axis)
-                    except ValueError:
-                        mask = np.all([[f[n].all() for n in mask.dtype.names]
-                                       for f in mask], axis=axis)
-                check._mask = mask
-        return check
+        return self._comparison(other, operator.ne)
 
     def __add__(self, other):
         """
@@ -4361,7 +4340,7 @@ class MaskedArray(ndarray):
 
             if self.shape is ():
                 if axis not in (None, 0):
-                    raise ValueError("'axis' entry is out of bounds")
+                    raise np.AxisError("'axis' entry is out of bounds")
                 return 1
             elif axis is None:
                 if kwargs.get('keepdims', False):
@@ -4369,11 +4348,9 @@ class MaskedArray(ndarray):
                 return self.size
 
             axes = axis if isinstance(axis, tuple) else (axis,)
-            axes = tuple(a if a >= 0 else self.ndim + a for a in axes)
+            axes = tuple(normalize_axis_index(a, self.ndim) for a in axes)
             if len(axes) != len(set(axes)):
                 raise ValueError("duplicate value in 'axis'")
-            if builtins.any(a < 0 or a >= self.ndim for a in axes):
-                raise ValueError("'axis' entry is out of bounds")
             items = 1
             for ax in axes:
                 items *= self.shape[ax]
@@ -4913,7 +4890,7 @@ class MaskedArray(ndarray):
         # Explicit output
         result = self.filled(0).sum(axis, dtype=dtype, out=out, **kwargs)
         if isinstance(out, MaskedArray):
-            outmask = getattr(out, '_mask', nomask)
+            outmask = getmask(out)
             if (outmask is nomask):
                 outmask = out._mask = make_mask_none(out.shape)
             outmask.flat = newmask
@@ -4992,7 +4969,7 @@ class MaskedArray(ndarray):
         # Explicit output
         result = self.filled(1).prod(axis, dtype=dtype, out=out, **kwargs)
         if isinstance(out, MaskedArray):
-            outmask = getattr(out, '_mask', nomask)
+            outmask = getmask(out)
             if (outmask is nomask):
                 outmask = out._mask = make_mask_none(out.shape)
             outmask.flat = newmask
@@ -5071,10 +5048,10 @@ class MaskedArray(ndarray):
         if out is not None:
             out.flat = result
             if isinstance(out, MaskedArray):
-                outmask = getattr(out, '_mask', nomask)
+                outmask = getmask(out)
                 if (outmask is nomask):
                     outmask = out._mask = make_mask_none(out.shape)
-                outmask.flat = getattr(result, '_mask', nomask)
+                outmask.flat = getmask(result)
             return out
         return result
 
@@ -5157,7 +5134,7 @@ class MaskedArray(ndarray):
         if dvar.ndim:
             dvar._mask = mask_or(self._mask.all(axis, **kwargs), (cnt <= 0))
             dvar._update_from(self)
-        elif getattr(dvar, '_mask', False):
+        elif getmask(dvar):
             # Make sure that masked is returned when the scalar is masked.
             dvar = masked
             if out is not None:
@@ -5510,7 +5487,7 @@ class MaskedArray(ndarray):
         # Explicit output
         result = self.filled(fill_value).min(axis=axis, out=out, **kwargs)
         if isinstance(out, MaskedArray):
-            outmask = getattr(out, '_mask', nomask)
+            outmask = getmask(out)
             if (outmask is nomask):
                 outmask = out._mask = make_mask_none(out.shape)
             outmask.flat = newmask
@@ -5612,7 +5589,7 @@ class MaskedArray(ndarray):
         # Explicit output
         result = self.filled(fill_value).max(axis=axis, out=out, **kwargs)
         if isinstance(out, MaskedArray):
-            outmask = getattr(out, '_mask', nomask)
+            outmask = getmask(out)
             if (outmask is nomask):
                 outmask = out._mask = make_mask_none(out.shape)
             outmask.flat = newmask
@@ -5658,13 +5635,25 @@ class MaskedArray(ndarray):
         np.subtract(out, min_value, out=out, casting='unsafe')
         return out
 
+    def partition(self, *args, **kwargs):
+        warnings.warn("Warning: 'partition' will ignore the 'mask' "
+                      "of the {}.".format(self.__class__.__name__),
+                      stacklevel=2)
+        return super(MaskedArray, self).partition(*args, **kwargs)
+
+    def argpartition(self, *args, **kwargs):
+        warnings.warn("Warning: 'argpartition' will ignore the 'mask' "
+                      "of the {}.".format(self.__class__.__name__),
+                      stacklevel=2)
+        return super(MaskedArray, self).argpartition(*args, **kwargs)
+
     def take(self, indices, axis=None, out=None, mode='raise'):
         """
         """
         (_data, _mask) = (self._data, self._mask)
         cls = type(self)
         # Make sure the indices are not masked
-        maskindices = getattr(indices, '_mask', nomask)
+        maskindices = getmask(indices)
         if maskindices is not nomask:
             indices = indices.filled(0)
         # Get the data, promoting scalars to 0d arrays with [...] so that
@@ -6390,21 +6379,16 @@ class _frommethod:
     def __call__(self, a, *args, **params):
         if self.reversed:
             args = list(args)
-            arr = args[0]
-            args[0] = a
-            a = arr
-        # Get the method from the array (if possible)
+            a, args[0] = args[0], a
+
+        marr = asanyarray(a)
         method_name = self.__name__
-        method = getattr(a, method_name, None)
-        if method is not None:
-            return method(*args, **params)
-        # Still here ? Then a is not a MaskedArray
-        method = getattr(MaskedArray, method_name, None)
-        if method is not None:
-            return method(MaskedArray(a), *args, **params)
-        # Still here ? OK, let's call the corresponding np function
-        method = getattr(np, method_name)
-        return method(a, *args, **params)
+        method = getattr(type(marr), method_name, None)
+        if method is None:
+            # use the corresponding np function
+            method = getattr(np, method_name)
+
+        return method(marr, *args, **params)
 
 
 all = _frommethod('all')
@@ -6553,9 +6537,7 @@ def compressed(x):
         Equivalent method.
 
     """
-    if not isinstance(x, MaskedArray):
-        x = asanyarray(x)
-    return x.compressed()
+    return asanyarray(x).compressed()
 
 
 def concatenate(arrays, axis=0):
@@ -7344,9 +7326,9 @@ def inner(a, b):
     """
     fa = filled(a, 0)
     fb = filled(b, 0)
-    if len(fa.shape) == 0:
+    if fa.ndim == 0:
         fa.shape = (1,)
-    if len(fb.shape) == 0:
+    if fb.ndim == 0:
         fb.shape = (1,)
     return np.inner(fa, fb).view(MaskedArray)
 inner.__doc__ = doc_note(np.inner.__doc__,
@@ -7701,6 +7683,10 @@ def asanyarray(a, dtype=None):
     <class 'numpy.ma.core.MaskedArray'>
 
     """
+    # workaround for #8666, to preserve identity. Ideally the bottom line
+    # would handle this for us.
+    if isinstance(a, MaskedArray) and (dtype is None or dtype == a.dtype):
+        return a
     return masked_array(a, dtype=dtype, copy=False, keep_mask=True, subok=True)
 
 

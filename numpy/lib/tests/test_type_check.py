@@ -183,6 +183,15 @@ class TestIscomplexobj(TestCase):
         dummy = DummyPd()
         assert_(iscomplexobj(dummy))
 
+    def test_custom_dtype_duck(self):
+        class MyArray(list):
+            @property
+            def dtype(self):
+                return complex
+
+        a = MyArray([1+0j, 2+0j, 3+0j])
+        assert_(iscomplexobj(a))
+
 
 class TestIsrealobj(TestCase):
     def test_basic(self):
@@ -307,6 +316,16 @@ class TestNanToNum(TestCase):
     def test_generic(self):
         with np.errstate(divide='ignore', invalid='ignore'):
             vals = nan_to_num(np.array((-1., 0, 1))/0.)
+        assert_all(vals[0] < -1e10) and assert_all(np.isfinite(vals[0]))
+        assert_(vals[1] == 0)
+        assert_all(vals[2] > 1e10) and assert_all(np.isfinite(vals[2]))
+
+        # perform the same test but in-place
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vals = np.array((-1., 0, 1))/0.
+        result = nan_to_num(vals, copy=False)
+
+        assert_(result is vals)
         assert_all(vals[0] < -1e10) and assert_all(np.isfinite(vals[0]))
         assert_(vals[1] == 0)
         assert_all(vals[2] > 1e10) and assert_all(np.isfinite(vals[2]))
